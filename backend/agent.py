@@ -28,7 +28,7 @@ from bundle_tracker import build_bundle_state, elapsed_minutes, overdue_items
 CLAUDE_API_URL = "https://api.anthropic.com/v1/messages"
 CLAUDE_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 AGENT_MODEL = "claude-sonnet-4-6"
-MAX_TOOL_ITERATIONS = 5
+MAX_TOOL_ITERATIONS = 6
 
 SOFA_DOMAINS = ["pao2_fio2", "platelets", "bilirubin", "map_mmhg", "gcs", "creatinine", "urine_output_24h"]
 
@@ -332,6 +332,7 @@ async def run_agent_consult(db: Session, patient_id: str, suspected_source: Opti
 
     messages = [{"role": "user", "content": user_context}]
     trace = []
+    force_submission = False
 
     async with httpx.AsyncClient(timeout=30) as client:
         for _ in range(MAX_TOOL_ITERATIONS):
@@ -347,10 +348,19 @@ async def run_agent_consult(db: Session, patient_id: str, suspected_source: Opti
                     "max_tokens": 800,
                     "system": AGENT_SYSTEM_PROMPT,
                     "tools": TOOLS,                   
-                    "tool_choice": {"type": "any"},
+                    "tool_choice": (
+                        {"type": "tool", "name": "submit_assessment"}
+                        if force_submission else {"type": "any"}
+                    ),
                     "messages": messages,
                 },
             )
+            if resp.is_error:
+                return {
+                    "error": "Agent provider request failed.",
+                    "raw": resp.text[:1000],
+                    "trace": trace,
+                }
             data = resp.json()
 
             if "content" not in data:
@@ -360,14 +370,26 @@ async def run_agent_consult(db: Session, patient_id: str, suspected_source: Opti
             messages.append({"role": "assistant", "content": data["content"]})
 
             if stop_reason != "tool_use":
-                # Model stopped without calling submit_assessment -- treat as
-                # non-convergence rather than silently accepting free text,
-                # since we want the structured, parseable result.
-                fallback_text = "\n".join(
-                    b["text"] for b in data["content"] if b.get("type") == "text"
-                )
-                return {"error": "Agent stopped without submitting a structured assessment.",
-                        "fallback_text": fallback_text, "trace": trace}
+                # A normal-text reply is not sufficient. Retry once while
+                # explicitly forcing the schema-backed submission tool.
+                if force_submission:
+                    fallback_text = "\n".join(
+                        b["text"] for b in data["content"] if b.get("type") == "text"
+                    )
+                    return {
+                        "error": "Agent did not return a structured assessment.",
+                        "fallback_text": fallback_text,
+                        "trace": trace,
+                    }
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        "Submit the completed assessment now by calling "
+                        "submit_assessment. Do not return free text."
+                    ),
+                })
+                force_submission = True
+                continue
 
             tool_results = []
             submitted_assessment = None
@@ -394,5 +416,9 @@ async def run_agent_consult(db: Session, patient_id: str, suspected_source: Opti
                 return {"assessment": submitted_assessment, "trace": trace}
 
             messages.append({"role": "user", "content": tool_results})
+
+            # Reserve the final loop pass for the required structured result.
+            if _ == MAX_TOOL_ITERATIONS - 2:
+                force_submission = True
 
     return {"error": "Agent did not converge within iteration limit.", "trace": trace}
