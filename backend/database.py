@@ -37,6 +37,8 @@ class PatientSession(Base):
     patient_id = Column(String, index=True, nullable=False)
     baseline_sofa = Column(Integer, nullable=True)
     recognition_time = Column(DateTime, nullable=True)
+    last_pressor_drug = Column(String, nullable=True, default="none")
+    last_pressor_dose = Column(Float, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
     values = relationship("ClinicalValueRecord", back_populates="session")
@@ -69,6 +71,18 @@ class BundleConfirmation(Base):
     confirmed_by = Column(String, nullable=True)  # required for high-risk items
 
     session = relationship("PatientSession", back_populates="confirmations")
+
+
+class PushSubscription(Base):
+    """Web Push subscription for a user's device. A user can have multiple
+    (phone + laptop, etc). Endpoint is unique per browser/device pairing."""
+    __tablename__ = "push_subscriptions"
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    endpoint = Column(String, unique=True, nullable=False)
+    p256dh = Column(String, nullable=False)
+    auth = Column(String, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
 
 
 class AuditEventRecord(Base):

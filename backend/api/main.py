@@ -29,15 +29,17 @@ from sqlalchemy.orm import Session
 import httpx
 
 from database import (
-    init_db, get_db, User, PatientSession, ClinicalValueRecord,
-    BundleConfirmation, AuditEventRecord,
+    init_db, get_db, SessionLocal, User, PatientSession, ClinicalValueRecord,
+    BundleConfirmation, AuditEventRecord, PushSubscription,
 )
-from auth import authenticate_user, create_access_token, get_current_user, ACCESS_TOKEN_EXPIRE_MINUTES
+from auth import authenticate_user, create_access_token, get_current_user, ACCESS_TOKEN_EXPIRE_MINUTES, hash_password
 
 from models import SofaInput, ClinicalValue, PressorState, PressorDrug, DataStatus
 from sofa_calculator import calculate_sofa, delta_sofa, meets_sepsis3_criteria
 from bundle_tracker import build_bundle_state, elapsed_minutes, overdue_items, bundle_summary
 from data_validation import evaluate_clinical_value, requires_dual_confirmation
+from agent import run_agent_consult, tool_get_current_sofa, tool_get_bundle_status
+from push_notifications import send_push_to_roles
 
 app = FastAPI(title="Sepsis Bundle Agent API", version="1.0.0")
 
@@ -56,6 +58,31 @@ app.add_middleware(
 @app.on_event("startup")
 def on_startup():
     init_db()
+    seed_default_user_if_configured()
+
+
+def seed_default_user_if_configured():
+    """Creates one login from SEED_USERNAME/SEED_PASSWORD env vars if it
+    doesn't already exist. Lets a free-tier deployment (no shell access)
+    get its first user without any manual database access. Safe to leave
+    these env vars set permanently -- it only ever creates the user once."""
+    username = os.environ.get("SEED_USERNAME")
+    password = os.environ.get("SEED_PASSWORD")
+    if not username or not password:
+        return
+    full_name = os.environ.get("SEED_FULL_NAME", username)
+    db = SessionLocal()
+    try:
+        if db.query(User).filter(User.username == username).first():
+            return
+        user = User(
+            username=username, hashed_password=hash_password(password),
+            full_name=full_name, role="physician",
+        )
+        db.add(user)
+        db.commit()
+    finally:
+        db.close()
 
 
 def record_audit(db: Session, actor: str, action: str, detail: dict):
@@ -180,7 +207,9 @@ def sofa_calculate(req: SofaRequest, db: Session = Depends(get_db), user: User =
 
     if session.baseline_sofa is None:
         session.baseline_sofa = result.total
-        db.commit()
+    session.last_pressor_drug = req.pressor_drug
+    session.last_pressor_dose = req.pressor_dose
+    db.commit()
 
     delta = delta_sofa(result, session.baseline_sofa)
     sepsis3 = meets_sepsis3_criteria(result, session.baseline_sofa)
@@ -312,6 +341,125 @@ async def get_interpretation(req: InterpretationRequest, db: Session = Depends(g
 
     record_audit(db, user.username, "interpretation_requested", {"patient_id": req.patient_id})
     return {"interpretation": narration}
+
+
+# ---------- Agent (genuine tool-calling; still fully read-only) ----------
+
+class AgentConsultRequest(BaseModel):
+    patient_id: str
+    suspected_source: Optional[str] = None
+
+
+@app.post("/agent/consult")
+async def agent_consult(req: AgentConsultRequest, db: Session = Depends(get_db),
+                         user: User = Depends(get_current_user)):
+    """Unlike /interpretation, this endpoint hands Claude tools and lets it
+    decide what to look up and in what order. The response includes the tool
+    call trace so the agentic behavior is visible, not just asserted. Every
+    tool is read-only -- this endpoint cannot change any patient data."""
+    result = await run_agent_consult(db, req.patient_id, req.suspected_source)
+    record_audit(db, user.username, "agent_consult_requested", {
+        "patient_id": req.patient_id,
+        "tools_called": [t["tool"] for t in result.get("trace", [])],
+    })
+
+    # Final action: page the on-duty physician and nurse. This is a
+    # notification, not a clinical action -- it does not touch patient
+    # data or require confirmation, so it sits outside the dual-sign-off
+    # boundary that applies to actual bundle actions.
+    assessment = result.get("assessment")
+    if assessment:
+        actions = assessment.get("priority_actions") or []
+        body = assessment.get("summary", "")[:180]
+        if actions:
+            body += f" Top action: {actions[0]}"
+        push_result = send_push_to_roles(
+            db, roles=["physician", "nurse"],
+            title=f"Sepsis Bundle Agent \u2014 {req.patient_id}",
+            body=body or "New assessment available.",
+            url=f"/?patient_id={req.patient_id}",
+        )
+        result["push_notification"] = push_result
+        record_audit(db, "system", "alert_pushed", {"patient_id": req.patient_id, **push_result})
+
+    return result
+
+
+# ---------- Web Push subscriptions ----------
+
+class PushSubscribeRequest(BaseModel):
+    endpoint: str
+    p256dh: str
+    auth: str
+
+
+@app.get("/push/vapid-public-key")
+def get_vapid_public_key():
+    return {"key": os.environ.get("VAPID_APPLICATION_SERVER_KEY", "")}
+
+
+@app.post("/push/subscribe")
+def push_subscribe(req: PushSubscribeRequest, db: Session = Depends(get_db),
+                    user: User = Depends(get_current_user)):
+    existing = db.query(PushSubscription).filter(PushSubscription.endpoint == req.endpoint).first()
+    if existing:
+        existing.user_id = user.id
+        existing.p256dh = req.p256dh
+        existing.auth = req.auth
+    else:
+        db.add(PushSubscription(
+            user_id=user.id, endpoint=req.endpoint, p256dh=req.p256dh, auth=req.auth,
+        ))
+    db.commit()
+    return {"status": "subscribed"}
+
+
+@app.post("/push/unsubscribe")
+def push_unsubscribe(req: PushSubscribeRequest, db: Session = Depends(get_db),
+                      user: User = Depends(get_current_user)):
+    db.query(PushSubscription).filter(PushSubscription.endpoint == req.endpoint).delete()
+    db.commit()
+    return {"status": "unsubscribed"}
+
+
+# ---------- Triage prioritization (deterministic, no LLM) ----------
+
+@app.get("/triage/priority")
+def triage_priority(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    """Ranks all active patient sessions by acuity so the busiest picture is
+    visible at a glance, without needing to open each patient individually.
+    Ranking itself is pure arithmetic on already-computed values -- no LLM
+    involvement, consistent with the rest of the deterministic core."""
+    sessions = db.query(PatientSession).order_by(PatientSession.created_at.desc()).all()
+
+    rows = []
+    for session in sessions:
+        sofa = tool_get_current_sofa(db, session.patient_id)
+        if "error" in sofa:
+            continue
+        bundle = tool_get_bundle_status(db, session.patient_id)
+        overdue_count = len(bundle.get("overdue", []))
+        delta = sofa.get("delta_from_baseline") or 0
+
+        # Simple, transparent priority score: overdue bundle items weigh
+        # heaviest (time-critical protocol gaps), then absolute SOFA burden,
+        # then trend direction. Weights are a starting point, not a validated
+        # scoring system -- flag this clearly wherever the score is shown.
+        priority_score = (overdue_count * 100) + (sofa["total"] * 5) + (max(delta, 0) * 10)
+
+        rows.append({
+            "patient_id": session.patient_id,
+            "sofa_total": sofa["total"],
+            "sofa_completeness": sofa["completeness"],
+            "delta_from_baseline": delta,
+            "meets_sepsis3_criteria": sofa.get("meets_sepsis3_criteria"),
+            "overdue_bundle_items": overdue_count,
+            "elapsed_minutes": bundle.get("elapsed_minutes"),
+            "priority_score": priority_score,
+        })
+
+    rows.sort(key=lambda r: r["priority_score"], reverse=True)
+    return {"patients": rows}
 
 
 # ---------- Audit ----------

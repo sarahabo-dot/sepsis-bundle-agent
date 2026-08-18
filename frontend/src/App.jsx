@@ -115,6 +115,12 @@ export default function SepsisBundleAgent() {
   const [interpLoading, setInterpLoading] = useState(false);
   const [interpError, setInterpError] = useState("");
 
+  const [agentResult, setAgentResult] = useState(null);
+  const [agentLoading, setAgentLoading] = useState(false);
+  const [agentError, setAgentError] = useState("");
+
+  const [pushStatus, setPushStatus] = useState("");
+
   const [apiError, setApiError] = useState("");
 
   function authHeaders(extra = {}) {
@@ -228,6 +234,69 @@ export default function SepsisBundleAgent() {
     }
   }
 
+  async function askAgent() {
+    if (!patientId) return;
+    setAgentLoading(true);
+    setAgentError("");
+    setAgentResult(null);
+    try {
+      const resp = await fetch(`${API_BASE}/agent/consult`, {
+        method: "POST", headers: authHeaders({ "Content-Type": "application/json" }),
+        body: JSON.stringify({ patient_id: patientId, suspected_source: sourceSuspected || undefined }),
+      });
+      if (resp.status === 401) { setAuth(null); return; }
+      const data = await resp.json();
+      if (data.error) { setAgentError(data.error); return; }
+      setAgentResult(data);
+    } catch (e) {
+      setAgentError("Could not reach the agent.");
+    } finally {
+      setAgentLoading(false);
+    }
+  }
+
+  function urlBase64ToUint8Array(base64String) {
+    const padding = "=".repeat((4 - (base64String.length % 4)) % 4);
+    const base64 = (base64String + padding).replace(/-/g, "+").replace(/_/g, "/");
+    const rawData = window.atob(base64);
+    return Uint8Array.from([...rawData].map((c) => c.charCodeAt(0)));
+  }
+
+  async function enablePushAlerts() {
+    setPushStatus("Requesting permission\u2026");
+    try {
+      if (!("serviceWorker" in navigator) || !("PushManager" in window)) {
+        setPushStatus("Push notifications aren't supported on this browser/device.");
+        return;
+      }
+      const permission = await Notification.requestPermission();
+      if (permission !== "granted") {
+        setPushStatus("Permission denied \u2014 enable notifications in browser settings to receive alerts.");
+        return;
+      }
+      const keyResp = await fetch(`${API_BASE}/push/vapid-public-key`);
+      const { key } = await keyResp.json();
+      if (!key) { setPushStatus("Server push key not configured yet."); return; }
+
+      const registration = await navigator.serviceWorker.ready;
+      let subscription = await registration.pushManager.getSubscription();
+      if (!subscription) {
+        subscription = await registration.pushManager.subscribe({
+          userVisibleOnly: true,
+          applicationServerKey: urlBase64ToUint8Array(key),
+        });
+      }
+      const raw = subscription.toJSON();
+      await fetch(`${API_BASE}/push/subscribe`, {
+        method: "POST", headers: authHeaders({ "Content-Type": "application/json" }),
+        body: JSON.stringify({ endpoint: raw.endpoint, p256dh: raw.keys.p256dh, auth: raw.keys.auth }),
+      });
+      setPushStatus("Alerts enabled on this device.");
+    } catch (e) {
+      setPushStatus("Could not enable alerts: " + e.message);
+    }
+  }
+
   if (!auth) return <LoginScreen onLogin={setAuth} />;
 
   const totalColor = !sofa ? C.muted : sofa.total >= 11 ? C.crit : sofa.total >= 6 ? C.warn : sofa.total >= 2 ? C.info : C.stable;
@@ -245,9 +314,16 @@ export default function SepsisBundleAgent() {
           <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
             <div style={{ fontSize: 12, color: C.muted }}>Signed in as {auth.fullName} ({auth.role})</div>
             <input className="sba-input" placeholder="Patient ID" value={patientId} onChange={(e) => setPatientId(e.target.value)} style={{ ...inputStyle(false), width: 120 }} />
+            <button className="sba-btn" onClick={enablePushAlerts} title={pushStatus} style={{ background: "transparent", border: `1px solid ${C.info}66`, color: C.info, borderRadius: 6, padding: "8px 12px", fontSize: 12, cursor: "pointer" }}>
+              🔔 Enable alerts
+            </button>
             <button className="sba-btn" onClick={() => setAuth(null)} style={{ background: "transparent", border: `1px solid ${C.border}`, color: C.muted, borderRadius: 6, padding: "8px 12px", fontSize: 12, cursor: "pointer" }}>Sign out</button>
           </div>
         </div>
+
+        {pushStatus && (
+          <div style={{ fontSize: 11.5, color: C.muted, marginBottom: 10, textAlign: "right" }}>{pushStatus}</div>
+        )}
 
         {apiError && (
           <div style={{ background: C.crit + "22", border: `1px solid ${C.crit}`, borderRadius: 8, padding: "8px 12px", marginBottom: 14, fontSize: 13 }}>{apiError}</div>
@@ -345,6 +421,64 @@ export default function SepsisBundleAgent() {
           </div>
           {interpError && <div style={{ color: C.crit, fontSize: 13 }}>{interpError}</div>}
           {interpretation && <div style={{ fontSize: 13.5, lineHeight: 1.65, whiteSpace: "pre-wrap" }}>{interpretation}</div>}
+        </div>
+
+        <div style={{ background: C.panel, border: `1px solid ${C.info}55`, borderRadius: 12, padding: 18, marginTop: 16 }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12, flexWrap: "wrap", gap: 10 }}>
+            <div>
+              <div style={{ fontSize: 12, color: C.info, letterSpacing: 1, textTransform: "uppercase" }}>Agent Consult</div>
+              <div style={{ fontSize: 11, color: C.muted, marginTop: 2 }}>Agent chooses its own tools, then pages the on-duty team</div>
+            </div>
+            <button className="sba-btn" onClick={askAgent} disabled={agentLoading || !patientId} style={{ background: C.info, color: "#06111F", border: "none", borderRadius: 6, padding: "8px 16px", fontSize: 12.5, fontWeight: 600, cursor: "pointer", opacity: agentLoading || !patientId ? 0.5 : 1 }}>
+              {agentLoading ? "Investigating…" : "Ask agent"}
+            </button>
+          </div>
+          {agentError && <div style={{ color: C.crit, fontSize: 13, marginBottom: 8 }}>{agentError}</div>}
+          {agentResult?.trace?.length > 0 && (
+            <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 12 }}>
+              {agentResult.trace.map((t, i) => (
+                <span key={i} style={{ fontSize: 10.5, fontFamily: mono, background: C.panelAlt, border: `1px solid ${C.border}`, borderRadius: 4, padding: "3px 7px", color: C.info }}>
+                  {i + 1}. {t.tool}
+                </span>
+              ))}
+            </div>
+          )}
+          {agentResult?.assessment && (
+            <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+              <div style={{ fontSize: 13.5, lineHeight: 1.6 }}>{agentResult.assessment.summary}</div>
+              <div style={{ fontSize: 12.5 }}>
+                <span style={{ color: C.muted }}>Probable source: </span>
+                <span style={{ color: C.text, fontWeight: 600 }}>{agentResult.assessment.probable_source}</span>
+              </div>
+              {agentResult.assessment.priority_actions?.length > 0 && (
+                <div>
+                  <div style={{ fontSize: 11, color: C.muted, marginBottom: 4 }}>Priority actions</div>
+                  <ol style={{ margin: 0, paddingLeft: 18, fontSize: 13, lineHeight: 1.7 }}>
+                    {agentResult.assessment.priority_actions.map((a, i) => <li key={i}>{a}</li>)}
+                  </ol>
+                </div>
+              )}
+              {agentResult.assessment.data_quality_concerns?.length > 0 && (
+                <div style={{ background: C.warn + "18", border: `1px solid ${C.warn}55`, borderRadius: 6, padding: "8px 10px" }}>
+                  <div style={{ fontSize: 11, color: C.warn, marginBottom: 4 }}>Data quality concerns</div>
+                  {agentResult.assessment.data_quality_concerns.map((c, i) => (
+                    <div key={i} style={{ fontSize: 12.5 }}>{c}</div>
+                  ))}
+                </div>
+              )}
+              {agentResult.push_notification && (
+                <div style={{ fontSize: 11, color: C.muted, marginTop: 4 }}>
+                  🔔 Alert paged {agentResult.push_notification.sent} device(s)
+                  {agentResult.push_notification.skipped_reason ? ` (${agentResult.push_notification.skipped_reason})` : ""}
+                </div>
+              )}
+            </div>
+          )}
+          {!agentResult && !agentLoading && !agentError && (
+            <div style={{ fontSize: 12.5, color: C.muted, fontStyle: "italic" }}>
+              The agent investigates on its own (SOFA, trends, bundle status, data flags) before proposing anything.
+            </div>
+          )}
         </div>
 
         <div style={{ marginTop: 18, fontSize: 11, color: C.muted, textAlign: "center" }}>
