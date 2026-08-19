@@ -345,7 +345,7 @@ async def run_agent_consult(db: Session, patient_id: str, suspected_source: Opti
                 },
                 json={
                     "model": AGENT_MODEL,
-                    "max_tokens": 800,
+                                         "max_tokens": 1500,                  
                     "system": AGENT_SYSTEM_PROMPT,
                     "tools": TOOLS,                   
                     "tool_choice": (
